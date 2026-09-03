@@ -42,6 +42,9 @@ h1{font-size:28px} h2{font-size:17px} h3{font-size:14px;color:var(--muted);font-
 .spacer{flex:1}
 .icon{width:36px;height:36px;border-radius:var(--r);display:grid;place-items:center;color:var(--muted)}
 .icon:hover{background:var(--card)}
+.syncdot{width:8px;height:8px;border-radius:50%;background:var(--sand);flex:none;margin-right:2px;transition:background .3s}
+.syncdot.ok{background:var(--pos)}
+.syncdot.err,.syncdot.auth{background:var(--neg)}
 .banner{background:var(--sand);color:var(--text);padding:8px 20px;font-size:13px;display:none}
 .banner.show{display:block}
 main{max-width:1180px;margin:0 auto;padding:22px 20px 96px}
@@ -205,6 +208,7 @@ svg.chart{width:100%;max-width:100%;height:auto;display:block}
     <button class="tab" data-tab="inv">Inversiones</button>
   </nav>
   <div class="spacer"></div>
+  <span class="syncdot off" id="syncdot" title="Sincronización"></span>
   <button class="icon" id="settings" aria-label="Copia de seguridad"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg></button>
   <button class="icon" id="theme" aria-label="Cambiar tema"></button>
 </header>
@@ -246,7 +250,7 @@ const NOW=new Date();
 const TODAY=isoDate(NOW);
 const cls=n=>n>0?'pos':n<0?'neg':'';
 
-/* ---------- almacenamiento ---------- */
+/* ---------- almacenamiento local ---------- */
 const PFX='hf_';
 const hasStorage=()=>{try{localStorage.setItem('__t','1');localStorage.removeItem('__t');return true;}catch(e){return false;}};
 const mem={};
@@ -260,47 +264,248 @@ const store={
     if(!hasStorage()) return false;
     try{localStorage.setItem(PFX+k,JSON.stringify(v));return true;}catch(e){return false;}
   },
-  keys(){return Object.keys(localStorage).filter(k=>k.startsWith(PFX)).map(k=>k.slice(PFX.length));}
+  keys(){try{return Object.keys(localStorage).filter(k=>k.startsWith(PFX)).map(k=>k.slice(PFX.length));}catch(e){return Object.keys(mem);}}
 };
+
+/* ================= sincronización (GitHub) ================= */
+const GH={repo:'habitos-datos',path:'datos/estado.json',api:'https://api.github.com'};
+const TOKK='hfg_tok', OWNK='hfg_own', TSK='hfg_ts', SHAK='hfg_sha';
+const SYNC={estado:'off',ts:{},sucio:false,ocupado:false,timer:null};
+
+const jget=k=>{try{return JSON.parse(localStorage.getItem(k));}catch(e){return null;}};
+const jset=(k,v)=>{try{v==null?localStorage.removeItem(k):localStorage.setItem(k,JSON.stringify(v));}catch(e){}};
+const tok=()=>jget(TOKK), own=()=>jget(OWNK);
+const saveTs=()=>jset(TSK,SYNC.ts);
+
+/* base64 <-> texto con acentos y emojis */
+function b64enc(str){const b=new TextEncoder().encode(str);let s='';b.forEach(c=>s+=String.fromCharCode(c));return btoa(s);}
+function b64dec(b64){const s=atob(String(b64).replace(/\s/g,''));const a=new Uint8Array(s.length);
+  for(let i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return new TextDecoder().decode(a);}
+
+function syncUI(){
+  const d=document.getElementById('syncdot');if(!d)return;
+  d.className='syncdot '+SYNC.estado;
+  d.title={ok:'Sincronizado con tus otros dispositivos',
+    err:'Sin conexión: se guarda aquí y se subirá solo',
+    auth:'La llave ya no vale: vuelve a activarla',
+    off:'Sincronización sin activar'}[SYNC.estado]||'';
+}
+async function gh(path,opts={}){
+  const t=tok();if(!t)throw new Error('sin llave');
+  const r=await fetch(GH.api+path,Object.assign({},opts,{headers:Object.assign({
+    Authorization:'Bearer '+t,Accept:'application/vnd.github+json',
+    'X-GitHub-Api-Version':'2022-11-28','Content-Type':'application/json'},opts.headers||{})}));
+  if(r.status===401||r.status===403){SYNC.estado='auth';syncUI();throw new Error('llave rechazada');}
+  return r;
+}
+async function activar(token){
+  token=String(token||'').trim();
+  if(!token)throw new Error('Pega la llave');
+  const r=await fetch(GH.api+'/user',{headers:{Authorization:'Bearer '+token,
+    Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}});
+  if(!r.ok)throw new Error('La llave no es válida o ha caducado');
+  const u=await r.json();
+  const r2=await fetch(GH.api+'/repos/'+u.login+'/'+GH.repo,{headers:{Authorization:'Bearer '+token,
+    Accept:'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'}});
+  if(!r2.ok)throw new Error('No encuentro el repositorio "'+GH.repo+'" en tu cuenta '+u.login);
+  jset(TOKK,token);jset(OWNK,u.login);
+  return u.login;
+}
+function desactivar(){jset(TOKK,null);jset(SHAK,null);SYNC.estado='off';syncUI();}
+
+/* --- leer el archivo de datos de GitHub --- */
+async function leerNube(){
+  const r=await gh('/repos/'+own()+'/'+GH.repo+'/contents/'+GH.path+'?ref=HEAD&t='+Date.now());
+  if(r.status===404){jset(SHAK,null);return {sha:null,datos:{}};}
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const j=await r.json();
+  jset(SHAK,j.sha);
+  let datos={};
+  try{datos=JSON.parse(b64dec(j.content))||{};}catch(e){datos={};}
+  return {sha:j.sha,datos:datos};
+}
+async function escribirNube(datos,sha,intento){
+  const cuerpo={message:'Datos '+new Date().toISOString(),content:b64enc(JSON.stringify(datos))};
+  if(sha)cuerpo.sha=sha;
+  const r=await gh('/repos/'+own()+'/'+GH.repo+'/contents/'+GH.path,{method:'PUT',body:JSON.stringify(cuerpo)});
+  if(r.status===409||r.status===422){
+    if(intento)throw new Error('conflicto');
+    const n=await leerNube();
+    return escribirNube(mezclar(datos,n.datos),n.sha,true);
+  }
+  if(!r.ok)throw new Error('HTTP '+r.status);
+  const j=await r.json();
+  if(j&&j.content)jset(SHAK,j.content.sha);
+  return true;
+}
+/* une dos mapas {clave:{ts,v}} quedándose con lo más reciente */
+function mezclar(a,b){
+  const out=Object.assign({},a);
+  Object.keys(b||{}).forEach(k=>{if(!out[k]||(+b[k].ts||0)>(+out[k].ts||0))out[k]=b[k];});
+  return out;
+}
+function applyRemote(k,v){
+  if(k==='cfg'){S.cfg=v;applyTheme();}
+  else if(k==='hab_cfg')S.hab=v;
+  else if(k==='inv_idx')S.idx=v;
+  else if(k==='inv_trd')S.trd=v;
+  else if(k.slice(0,4)==='hab_')S.months[k.slice(4)]=v;
+  else if(k.slice(0,4)==='bud_')S.bud[k.slice(4)]=v;
+}
+let rrT=null;
+function scheduleRerender(){
+  clearTimeout(rrT);
+  rrT=setTimeout(()=>{
+    const a=document.activeElement;
+    if((a&&(a.tagName==='INPUT'||a.tagName==='SELECT'))||document.getElementById('overlay').classList.contains('show')){scheduleRerender();return;}
+    render();toast('Actualizado desde otro dispositivo');
+  },900);
+}
+/* baja lo nuevo de la nube al dispositivo */
+async function pullAll(repintar){
+  if(!tok())return;
+  try{
+    const {datos}=await leerNube();
+    const ch=[];
+    Object.keys(datos).forEach(k=>{
+      const ts=+datos[k].ts||0;
+      if(ts<=(SYNC.ts[k]||0))return;
+      SYNC.ts[k]=ts;mem[k]=datos[k].v;
+      try{localStorage.setItem(PFX+k,JSON.stringify(datos[k].v));}catch(e){}
+      ch.push(k);
+    });
+    SYNC.estado='ok';
+    if(ch.length){saveTs();if(repintar){ch.forEach(k=>applyRemote(k,mem[k]));scheduleRerender();}}
+  }catch(e){if(SYNC.estado!=='auth')SYNC.estado='err';}
+  syncUI();
+}
+/* sube todo lo local (agrupado, no un archivo por cambio) */
+async function subir(){
+  if(!tok()||SYNC.ocupado){SYNC.sucio=true;return;}
+  SYNC.ocupado=true;SYNC.sucio=false;
+  try{
+    const remoto=await leerNube();
+    const local={};
+    for(const k of store.keys())local[k]={ts:SYNC.ts[k]||0,v:await store.get(k,null)};
+    const fin=mezclar(local,remoto.datos);
+    /* lo que la nube tenía más nuevo, aplícalo también aquí */
+    const ch=[];
+    Object.keys(fin).forEach(k=>{
+      const ts=+fin[k].ts||0;
+      if(ts>(SYNC.ts[k]||0)){SYNC.ts[k]=ts;mem[k]=fin[k].v;
+        try{localStorage.setItem(PFX+k,JSON.stringify(fin[k].v));}catch(e){}ch.push(k);}
+    });
+    await escribirNube(fin,remoto.sha,false);
+    saveTs();SYNC.estado='ok';
+    if(ch.length){ch.forEach(k=>applyRemote(k,mem[k]));scheduleRerender();}
+  }catch(e){if(SYNC.estado!=='auth')SYNC.estado='err';SYNC.sucio=true;}
+  SYNC.ocupado=false;syncUI();
+  if(SYNC.sucio)setTimeout(subir,4000);
+}
+function subirLuego(){clearTimeout(SYNC.timer);SYNC.timer=setTimeout(subir,2000);}
+async function borrarNube(){
+  if(!tok())return;
+  try{const r=await leerNube();await escribirNube({},r.sha,false);}catch(e){}
+}
+async function initSync(){
+  SYNC.ts=jget(TSK)||{};
+  if(!tok()||!own()){SYNC.estado='off';syncUI();return;}
+  await pullAll(false);
+}
+function arrancarSync(){
+  const tick=()=>{if(!document.hidden&&tok()){if(SYNC.sucio)subir();else pullAll(true);}};
+  setInterval(tick,30000);
+  document.addEventListener('visibilitychange',()=>{if(!document.hidden)tick();});
+  window.addEventListener('online',tick);
+  window.addEventListener('focus',tick);
+}
+
 /* ---------- copia de seguridad ---------- */
-function exportAll(){
+async function exportAll(){
   const data={app:'habitos-finanzas',v:1,fecha:new Date().toISOString(),datos:{}};
-  store.keys().forEach(k=>{try{data.datos[k]=JSON.parse(localStorage.getItem(PFX+k));}catch(e){}});
+  for(const k of store.keys())data.datos[k]=await store.get(k,null);
   const blob=new Blob([JSON.stringify(data,null,1)],{type:'application/json'});
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=`habitos-finanzas-${TODAY}.json`;
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='habitos-finanzas-'+TODAY+'.json';
   document.body.appendChild(a);a.click();setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1000);
+  toast('Copia exportada');
 }
 function importAll(file){
   const rd=new FileReader();
-  rd.onload=()=>{try{const j=JSON.parse(rd.result);if(!j||j.app!=='habitos-finanzas'||!j.datos)throw 0;
-    if(!confirm('Se sustituirán los datos de este dispositivo por los de la copia. ¿Continuar?'))return;
-    store.keys().forEach(k=>localStorage.removeItem(PFX+k));
-    Object.entries(j.datos).forEach(([k,v])=>localStorage.setItem(PFX+k,JSON.stringify(v)));
-    location.reload();}
-  catch(e){toast('Ese archivo no es una copia válida');}};
+  rd.onload=async()=>{try{
+    const j=JSON.parse(rd.result);
+    if(!j||j.app!=='habitos-finanzas'||!j.datos)throw 0;
+    if(!confirm('Se sustituirán los datos actuales'+(tok()?', también en tus otros dispositivos':'')+'. ¿Continuar?'))return;
+    store.keys().forEach(k=>{try{localStorage.removeItem(PFX+k);}catch(e){}delete mem[k];});
+    const ts=Date.now();SYNC.ts={};
+    Object.entries(j.datos).forEach(([k,v])=>{mem[k]=v;SYNC.ts[k]=ts;
+      try{localStorage.setItem(PFX+k,JSON.stringify(v));}catch(e){}});
+    saveTs();
+    if(tok()){toast('Importando…');await borrarNube();await subir();}
+    location.reload();
+  }catch(e){toast('Ese archivo no es una copia válida');}};
   rd.readAsText(file);
 }
+
+/* ---------- panel de ajustes ---------- */
 function settingsModal(){
-  const n=store.keys().length;
-  $('#modal').innerHTML=`<h2>Copia de seguridad</h2>
-    <p class="tiny" style="margin:8px 0 14px">Los datos se guardan en este dispositivo. Para pasarlos a otro, exporta una copia a iCloud Drive y ábrela allí con Importar.</p>
+  const t=tok(),n=store.keys().length;
+  const est=t?(SYNC.estado==='err'?'Sin conexión ahora mismo; los cambios se subirán solos.'
+      :SYNC.estado==='auth'?'La llave ya no vale (habrá caducado). Vuelve a activarla.'
+      :'Sincronización activa. Tus datos aparecen en todos tus dispositivos.')
+    :'Sin sincronizar: los datos solo están en este dispositivo.';
+  const bloque=t
+    ? `<div class="tiny">Conectado a GitHub como <b>${esc(own()||'')}</b></div>
+       <button class="btn" id="syncNow">Sincronizar ahora</button>
+       <button class="btn" id="outBtn">Quitar la llave de este dispositivo</button>`
+    : `<input class="inp" id="ghTok" placeholder="Pega aquí la llave (github_pat_…)" autocapitalize="off" autocorrect="off" spellcheck="false">
+       <button class="btn primary" id="inBtn">Activar sincronización</button>
+       <div class="tiny" id="ghErr" style="color:var(--neg)"></div>`;
+  document.getElementById('modal').innerHTML=`<h2>Sincronización y copias</h2>
+    <p class="tiny" style="margin:8px 0 12px">${est}</p>
+    <div style="display:grid;gap:8px">${bloque}</div>
+    <div style="height:1px;background:var(--line);margin:16px 0"></div>
     <div style="display:grid;gap:8px">
-      <button class="btn primary" id="expBtn">Exportar copia${n?'':' (todavía no hay datos)'}</button>
+      <button class="btn" id="expBtn">Exportar copia${n?'':' (todavía no hay datos)'}</button>
       <label class="btn" style="text-align:center;cursor:pointer">Importar copia<input type="file" accept=".json,application/json" id="impInp" style="display:none"></label>
-      <button class="btn danger" id="wipeBtn">Borrar todo en este dispositivo</button>
+      <button class="btn danger" id="wipeBtn">Borrar todos los datos</button>
     </div>
     <div class="actions"><button class="btn" data-act="closemodal">Cerrar</button></div>`;
-  $('#overlay').classList.add('show');
-  $('#expBtn').onclick=()=>{exportAll();toast('Copia exportada');};
-  $('#impInp').onchange=e=>{if(e.target.files[0])importAll(e.target.files[0]);};
-  $('#wipeBtn').onclick=()=>{if(!confirm('¿Borrar todos los datos de este dispositivo? Esto no se puede deshacer.'))return;
-    store.keys().forEach(k=>localStorage.removeItem(PFX+k));location.reload();};
+  document.getElementById('overlay').classList.add('show');
+  const $$=id=>document.getElementById(id);
+  $$('expBtn').onclick=()=>exportAll();
+  $$('impInp').onchange=e=>{if(e.target.files[0])importAll(e.target.files[0]);};
+  $$('wipeBtn').onclick=async()=>{
+    if(!confirm('¿Borrar todos los datos'+(tok()?', también los de la nube y los de tus otros dispositivos':'')+'? Esto no se puede deshacer.'))return;
+    store.keys().forEach(k=>{try{localStorage.removeItem(PFX+k);}catch(e){}delete mem[k];});
+    try{localStorage.removeItem(TSK);}catch(e){}
+    await borrarNube();location.reload();};
+  if($$('syncNow'))$$('syncNow').onclick=async()=>{$$('syncNow').textContent='Sincronizando…';await subir();$$('syncNow').textContent='Sincronizar ahora';toast('Sincronizado');};
+  if($$('outBtn'))$$('outBtn').onclick=()=>{if(confirm('¿Quitar la llave? Los datos siguen en este dispositivo.')){desactivar();closeModal();}};
+  if($$('inBtn'))$$('inBtn').onclick=async()=>{
+    const b=$$('inBtn');b.disabled=true;b.textContent='Conectando…';$$('ghErr').textContent='';
+    try{
+      await activar($$('ghTok').value);
+      const ts=Date.now();
+      for(const k of store.keys())if(!SYNC.ts[k])SYNC.ts[k]=ts;
+      saveTs();
+      await pullAll(false);await subir();
+      location.reload();
+    }catch(e){$$('ghErr').textContent=e.message||'No se pudo conectar';b.disabled=false;b.textContent='Activar sincronización';}
+  };
 }
-document.addEventListener('DOMContentLoaded',()=>{$('#settings').onclick=settingsModal;});
+document.getElementById('settings').onclick=settingsModal;
+
+/* ---------- guardado ---------- */
 const timers={};
 function save(k,v){
+  mem[k]=v;
   clearTimeout(timers[k]);
-  timers[k]=setTimeout(async()=>{const ok=await store.set(k,v);if(!ok)$('#banner').classList.add('show');},350);
+  timers[k]=setTimeout(async()=>{
+    const ok=await store.set(k,v);
+    if(!ok&&!tok())document.getElementById('banner').classList.add('show');
+    SYNC.ts[k]=Date.now();saveTs();
+    subirLuego();
+  },350);
 }
 
 /* ---------- estado ---------- */
@@ -746,7 +951,8 @@ document.addEventListener('click',e=>{
 
 /* ============================== arranque ============================== */
 (async function init(){
-  if(!hasStorage())$('#banner').classList.add('show');
+  await initSync();
+  if(!hasStorage()&&!tok())$('#banner').classList.add('show');
   S.cfg=await store.get('cfg',{theme:null});applyTheme();
   const hc=await store.get('hab_cfg',null);
   if(hc&&hc.habits)S.hab=hc;else{S.hab={habits:DEFAULT_HABITS.map(n=>({id:uid(),name:n}))};save('hab_cfg',S.hab);}
@@ -755,6 +961,9 @@ document.addEventListener('click',e=>{
   await loadMonth(S.y,S.m);
   await loadBud(S.budY);
   render();
+  syncUI();
+  arrancarSync();
+  if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
 })();
 </script>
 </body>
